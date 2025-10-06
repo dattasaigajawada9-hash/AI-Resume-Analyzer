@@ -1,0 +1,132 @@
+# backend/main.py
+import os
+import io
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import fitz  # PyMuPDF
+import docx
+import openai
+
+# ---- Config ----
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "<PUT_YOUR_KEY_IN_.env>")
+openai.api_key = OPENAI_API_KEY
+
+app = FastAPI()
+
+# Allow local frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- Helpers: parse resume file ----
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text_parts = []
+    for page in doc:
+        text_parts.append(page.get_text())
+    return "\n".join(text_parts)
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    with io.BytesIO(file_bytes) as f:
+        doc = docx.Document(f)
+        paragraphs = [p.text for p in doc.paragraphs]
+        return "\n".join(paragraphs)
+
+def extract_text(filename: str, file_bytes: bytes) -> str:
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        return extract_text_from_pdf(file_bytes)
+    if lower.endswith(".docx") or lower.endswith(".doc"):
+        return extract_text_from_docx(file_bytes)
+    # fallback: try decode
+    try:
+        return file_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+# ---- Helpers: OpenAI calls ----
+def analyze_resume_with_llm(resume_text: str) -> dict:
+    """
+    Sends a structured prompt to the LLM to get a JSON-like analysis.
+    """
+    system = (
+        "You are an expert career coach and resume reviewer. "
+        "Given resume text, produce a JSON object with keys: overall_score (0-100), "
+        "summary, strengths (list), weaknesses (list), improvement_suggestions (list), "
+        "keywords (list of suggested keywords). Return valid JSON only."
+    )
+    user_prompt = f"Resume text:\n\n{resume_text[:4000]}\n\nRespond with the JSON only."
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",  # replace with the model you have access to if needed
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_tokens=800,
+    )
+    text = resp.choices[0].message.content.strip()
+    # Try to parse JSON safely:
+    import json
+    try:
+        parsed = json.loads(text)
+        return parsed
+    except Exception:
+        # fallback: return raw text
+        return {"raw": text}
+
+def get_embedding(text: str) -> np.ndarray:
+    # Use OpenAI embeddings
+    resp = openai.Embedding.create(model="text-embedding-3-small", input=text[:8192])
+    vec = np.array(resp["data"][0]["embedding"], dtype=np.float32)
+    return vec
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    if a is None or b is None:
+        return 0.0
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+# ---- API models ----
+class AnalyzeResponse(BaseModel):
+    analysis: dict
+    match_score: float = 0.0
+    error: str | None = None
+
+# ---- Endpoints ----
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    file: UploadFile = File(...),
+    job_description: str | None = Form(None),
+):
+    try:
+        contents = await file.read()
+        text = extract_text(file.filename, contents)
+        if not text.strip():
+            return {"analysis": {}, "match_score": 0.0, "error": "Could not extract text from file."}
+
+        # 1) LLM resume analysis
+        analysis = analyze_resume_with_llm(text)
+
+        # 2) If job_description provided, compute embedding similarity
+        match_score = 0.0
+        if job_description and job_description.strip():
+            try:
+                emb_resume = get_embedding(text)
+                emb_job = get_embedding(job_description)
+                sim = cosine_similarity(emb_resume, emb_job)  # between -1..1
+                # Normalize to 0..100
+                match_score = max(0.0, min(100.0, round((sim + 1) / 2 * 100, 2)))
+            except Exception as e:
+                print("Embedding error:", e)
+
+        return {"analysis": analysis, "match_score": match_score, "error": None}
+    except Exception as e:
+        return {"analysis": {}, "match_score": 0.0, "error": str(e)}
